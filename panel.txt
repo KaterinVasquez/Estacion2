@@ -1,0 +1,141 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define LedON 4         // LED ON/OFF
+#define RST_PIN 14 // Pin de reinicio del MFRC522
+#define SS_PIN 5  //SDA Pin de selección de esclavo del MFRC522
+#define SLAVE_ADDR 0x04
+
+// Parámetros de conexión WiFi
+#define ssid "Kat"
+#define password "12345678"
+
+
+// Parámetros de conexión MQTT
+#define mqtt_server "qhali.online"
+#define mqtt_port 1883
+#define mqtt_user "esp"
+#define mqtt_pass "123456"
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+MFRC522 mfrc522(SS_PIN, RST_PIN); // Crear instancia de MFRC522
+bool LecturaAnterior = false; //estado previo
+bool tarjetaLeida = false;        // Bandera para saber si la tarjeta ha sido leída
+String nombreTarjeta = ""; // Variable para almacenar el nombre de la tarjeta
+
+bool sistemaEncendido = false;  // Indica si el sistema está encendido
+bool confirmacionEnviada = false; // Controla si la confirmación ya fue enviada
+bool juegoRecibido = false;      // Controla si el juego ha sido recibido
+
+// Variables para el mensaje
+//int juegoSeleccionado;
+String juegoJugado;
+int errores;
+     int secuencias_completadas;
+      int puntaje;
+
+
+long lastMsg = 0;
+char msg[50];
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LedON, OUTPUT);
+  Wire.begin(SLAVE_ADDR);
+  Wire.onReceive(receiveEvent);  // Se ejecuta cuando recibe un dato del maestro
+  Wire.onRequest(requestEvent);   // Se ejecuta cuando el maestro pide datos
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  SPI.begin();        // Inicializar bus SPI
+  mfrc522.PCD_Init(); // Inicializar MFRC522
+}
+
+void loop() {
+ if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+}
+
+void receiveEvent(int howMany) {
+  if (howMany > 0) {
+    char comando = Wire.read();  // Lee el mensaje del maestro
+
+    if (comando == '5') {  // Encender el sistema
+      sistemaEncendido = true;
+      confirmacionEnviada = false;  // Resetea la confirmación al encender
+      juegoRecibido = false;        // Resetea para permitir recibir un juego
+      Serial.println("Sistema encendido por el maestro.");
+      digitalWrite(LedON, HIGH);
+      LecturaAnterior = false;
+      tarjetaLeida = false; // Resetear la bandera de tarjeta leída
+      Serial.print("Coloque su tarjeta...");
+    }
+    else if (comando == '6') {  // Apagar el sistema
+      sistemaEncendido = false;
+      confirmacionEnviada = false;  // Resetea la confirmación al apagar
+      Serial.println("Sistema apagado por el maestro.");
+      digitalWrite(LedON, LOW);
+      LecturaAnterior = true;  // Bloquear nuevas lecturas mientras el sistema está apagado
+        ESP.restart(); 
+    }
+    else if (sistemaEncendido && comando >= 'F'){//1' && comando <= '3') {  // Recibe el número del juego
+      Serial.print("Datos recibidos por el maestro: ");
+      Serial.println(comando);
+      String mensaje = "";  // Aquí almacenaremos el mensaje completo
+      // Leer el resto del mensaje
+      while (Wire.available()) {
+        char c = Wire.read();  // Leer cada byte
+        mensaje += c;  // Construir la cadena
+      }
+      // Separar los valores en la cadena recibida
+      int coma1 = mensaje.indexOf(',');  // Encontrar la primera coma
+      int coma2 = mensaje.indexOf(',', coma1 + 1);  // Segunda coma
+      int coma3 = mensaje.indexOf(',', coma2 + 1);  // Tercera coma
+
+      // Extraer los valores de la cadena recibida
+      juegoJugado = mensaje.substring(0, coma1);
+      errores = mensaje.substring(coma1 + 1, coma2).toInt();
+      secuencias_completadas = mensaje.substring(coma2 + 1, coma3).toInt();
+      puntaje = mensaje.substring(coma3 + 1).toInt();
+
+      // Mostrar los datos recibidos
+      Serial.print("Juego seleccionado: ");
+      Serial.println(juegoJugado);
+      Serial.print("Errores: ");
+      Serial.println(errores);
+      Serial.print("Secuencias completadas: ");
+      Serial.println(secuencias_completadas);
+      Serial.print("Puntaje: ");
+      Serial.println(puntaje);
+      Serial.println("Nombre de la tarjeta: " + nombreTarjeta);
+      
+      juegoRecibido = true;  // Marca que el juego fue recibido
+    // enviar mqtt
+    enviarDatosMQTT();
+    }
+    // Solo proceder si el sistema está encendido y la lectura anterior fue realizada
+    if (sistemaEncendido && !LecturaAnterior) {
+      lecturaTarjeta();
+      LecturaAnterior = true;  // Marca que la lectura se realizó
+    }
+
+  }
+}
+void lecturaTarjeta() {
+  Serial.println("Esperando tarjeta...");
+  MFRC522::MIFARE_Key key;
+  for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+  byte block;
+  byte len;
+  MFRC522::StatusCode status;
+
+  // Esperar hasta que se detecte una tarjeta
+  while (!mfrc522.PICC_IsNewCardPresent()) {
+    delay(50); // Tiempo de espera para no saturar el procesador
+  }
